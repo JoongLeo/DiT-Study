@@ -64,7 +64,7 @@ class TimestepEmbedder(nn.Module): # 作用：把标量扩散步 t 映射到模�
         return t_emb
 
 
-class LabelEmbedder(nn.Module):
+class LabelEmbedder(nn.Module): # 作用：把类别标签 y 映射到向量，且支持 classifier‑free guidance。
     """
     Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
     """
@@ -75,7 +75,7 @@ class LabelEmbedder(nn.Module):
         self.num_classes = num_classes
         self.dropout_prob = dropout_prob
 
-    def token_drop(self, labels, force_drop_ids=None):
+    def token_drop(self, labels, force_drop_ids=None):   # 以 dropout_prob 随机把 label 替换为“空类别”。
         """
         Drops labels to enable classifier-free guidance.
         """
@@ -83,11 +83,11 @@ class LabelEmbedder(nn.Module):
             drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
         else:
             drop_ids = force_drop_ids == 1
-        labels = torch.where(drop_ids, self.num_classes, labels)
+        labels = torch.where(drop_ids, self.num_classes, labels) 
         return labels
 
-    def forward(self, labels, train, force_drop_ids=None):
-        use_dropout = self.dropout_prob > 0
+    def forward(self, labels, train, force_drop_ids=None): # 训练时，随机把 label 替换为“空类别”；测试时，不替换。
+        use_dropout = self.dropout_prob > 0 # 如果 dropout_prob > 0，会加一个额外“空类别”embedding（ID = num_classes）。
         if (train and use_dropout) or (force_drop_ids is not None):
             labels = self.token_drop(labels, force_drop_ids)
         embeddings = self.embedding_table(labels)
