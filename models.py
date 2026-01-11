@@ -15,16 +15,16 @@ import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 
-# 开始准备注释解读
+# 开始准备注释解读：实现 adaLN 的核心计算，把归一化后的特征 x 做仿射调制：
 def modulate(x, shift, scale):
-    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1) # 这里 unsqueeze(1) 让 shift/scale 从 (N, D) 变成 (N, 1, D)，对 token 维做广播。
 
 
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
 #################################################################################
 
-class TimestepEmbedder(nn.Module):
+class TimestepEmbedder(nn.Module): # 作用：把标量扩散步 t 映射到模型隐藏维 hidden_size。
     """
     Embeds scalar timesteps into vector representations.
     """
@@ -34,11 +34,11 @@ class TimestepEmbedder(nn.Module):
             nn.Linear(frequency_embedding_size, hidden_size, bias=True),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size, bias=True),
-        )
+        ) # 输出维度 frequency_embedding_size，再通过 2 层 MLP + SiLU 映射到 hidden_size。
         self.frequency_embedding_size = frequency_embedding_size
 
     @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
+    def timestep_embedding(t, dim, max_period=10000): # timestep_embedding 用正余弦位置编码（类似 Transformer 位置编码），频率范围由 max_period 控制。
         """
         Create sinusoidal timestep embeddings.
         :param t: a 1-D Tensor of N indices, one per batch element.
@@ -55,7 +55,7 @@ class TimestepEmbedder(nn.Module):
         args = t[:, None].float() * freqs[None]
         embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1) # 如果 dim 是奇数，会补一个 0 维度。
         return embedding
 
     def forward(self, t):
