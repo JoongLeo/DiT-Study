@@ -104,27 +104,32 @@ class DiTBlock(nn.Module):
     """
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
         super().__init__()
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6) # 把每个 token 的特征向量拉回到一个标准范围，但不让它自己再学一层缩放/平移，因为这一步会交给后面的条件调制（adaLN）去做。
+        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)  # Multi‑Head Self‑Attention
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0) # Pointwise Feedforward
+        
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
-        )
+        )     # Scale, Shift (γ, β)：adaLN_modulation 生成的 shift_* 和 scale_*
 
-    def forward(self, x, c):
+    def forward(self, x, c):  # x 是 (N, T, D)，c 是 (N, D)。 输出也是 (N, T, D)。
+        # Scale α1/α2（门控）：gate_msa 和 gate_mlp，对两条残差分支的输出做缩放。
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        # gate_msa 就是图里 α1
+        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa)) # 图中流程：LayerNorm → Scale/Shift(γ1,β1) → MSA → Scale(α1) → 残差加回
+        # gate_mlp 就是图里的 α2
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp)) # 图中流程：LayerNorm → Scale/Shift(γ2,β2) → MLP → Scale(α2) → 残差加回
         return x
 
 
 class FinalLayer(nn.Module):
     """
-    The final layer of DiT.
+    The final layer of DiT. # FinalLayer 就是“把 Transformer token 通过条件化 LayerNorm 调制后，映射回 patch 空间”，从而产出扩散模型需要预测的噪声/均值等输出。
     """
     def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
@@ -166,13 +171,14 @@ class DiT(nn.Module):
         self.patch_size = patch_size
         self.num_heads = num_heads
 
-        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
+        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True) # 把 (N,C,H,W) 的输入切成 patch 并投影成 token 序列 (N,T,D)
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False) # 形状是 (1, T, D)，会 broadcast 到 batch。 固定 2D sincos 位置编码（不训练）
 
+        # Transformer 主干：depth 个 DiTBlock； 整体输出形状先是 (N, T, p^2*out_channels)，然后 unpatchify 回到 (N, out_channels, H, W)。
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
         ])
@@ -205,7 +211,9 @@ class DiT(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
         # Zero-out adaLN modulation layers in DiT blocks:
-        for block in self.blocks:
+        # 结论：Transformer 一开始几乎是“恒等映射”。
+        # 这在扩散训练里非常稳：你不会一上来就把 token 表示弄乱。
+        for block in self.blocks:   # 把每个 block 的 adaLN modulation 最后一层置零
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
@@ -215,7 +223,7 @@ class DiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
-    def unpatchify(self, x):
+    def unpatchify(self, x): # token 序列怎么还原成图像/latent（图里 “Linear and Reshape” 的代码实现部分）
         """
         x: (N, T, patch_size**2 * C)
         imgs: (N, H, W, C)
@@ -226,8 +234,8 @@ class DiT(nn.Module):
         assert h * w == x.shape[1]
 
         x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
-        x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
+        x = torch.einsum('nhwpqc->nchpwq', x) # 用 einsum 重新排列维度，把通道提到前面，并把 patch 内坐标“铺”回空间：
+        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))# reshape → (N, C_out, h*p, w*p) 即 (N, C_out, H, W)
         return imgs
 
     def forward(self, x, t, y):
@@ -270,6 +278,8 @@ class DiT(nn.Module):
 #                   Sine/Cosine Positional Embedding Functions                  #
 #################################################################################
 # https://github.com/facebookresearch/mae/blob/main/util/pos_embed.py
+# 这三 个函数在做一件事：给每一个 patch（二维网格上的一个点），分配一个“固定、不学习、可解析”的位置向量
+# 这个向量由：一半维度编码 行坐标（height），一半维度编码 列坐标（width），并且每一半都是标准的 sin / cos Fourier 特征。
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
     """
@@ -289,7 +299,7 @@ def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=
     return pos_embed
 
 
-def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
+def get_2d_sincos_pos_embed_from_grid(embed_dim, grid): # 把 1D 的方法扩展到 2D
     assert embed_dim % 2 == 0
 
     # use half of dimensions to encode grid_h
@@ -300,7 +310,7 @@ def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
     return emb
 
 
-def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos): # 这和 Transformer 原始 positional encoding 本质是同一套东西
     """
     embed_dim: output dimension for each position
     pos: a list of positions to be encoded: size (M,)
